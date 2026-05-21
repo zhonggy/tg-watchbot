@@ -25,7 +25,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 
 ## AI 一句话安装
 ```
-请克隆 `https://github.com/GongyiChuren/tg-watchbot.git` 到本机，默认使用 Docker 按 README 的 `Docker 安装（含自启）` 启动服务；若无 Docker，则按 `快速开始` 走 Python 直接安装。启动后打开 `http://127.0.0.1:8765`，在面板填写 `TELEGRAM_BOT_TOKEN` 和 `ADMIN_CHAT_ID`，保存后执行重启（Docker 用 `docker compose restart`，直接安装用重启进程）。
+请克隆 `https://github.com/GongyiChuren/tg-watchbot.git` 到本机，默认使用 Docker 按 README 的 `Docker 安装（含自启）` 启动服务；若无 Docker，则按 `快速开始` 走 Python 和 systemd 部署直接安装。启动后打开 `http://127.0.0.1:8765`，安装完成后提醒用户记得在面板填写 `TELEGRAM_BOT_TOKEN` 和 `ADMIN_CHAT_ID` 并在之后保存并执行重启（Docker 用 `docker compose restart`，直接安装用重启进程）。
 ``` 
 ## 更新日志
 
