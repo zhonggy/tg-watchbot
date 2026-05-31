@@ -1,7 +1,7 @@
 <div align="center">
   <h1>tg-watchbot</h1>
-  <p>Telegram 双向客服机器人 + Web/RSS 监控推送 + 可视化管理面板</p>
-  <p>双向对话 · 关键词监控 · 私聊广告拦截 · 多管理员 · 配置导入导出</p>
+  <p>Telegram 双向客服机器人 + Web/RSS 监控推送 + 频道媒体下载 + 可视化管理面板</p>
+  <p>双向对话 · 关键词监控 · 频道媒体下载 · 私聊广告拦截 · 多管理员 · 配置导入导出</p>
   <p>
     <a href="#ai-one-line-install">AI 一句话安装</a> ·
     <a href="#docker-install">Docker 安装</a> ·
@@ -13,11 +13,12 @@
 </div>
 
 ## 简介：
-tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器人** 和 **Web/RSS 监控推送** 合在一起：
+tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器人**、**Web/RSS 监控推送** 和 **频道媒体下载** 合在一起：
 
 - 普通用户私聊 Bot，消息会转发给管理员；
 - 管理员可以直接回复、主动发文字/图片、封禁/备注用户；
 - 后台定时监控 RSS 或网页，命中关键词、新条目、价格/库存变化后推送给管理员；
+- 使用 Telethon 用户账号自动下载频道/群组中的视频、文档等媒体文件；
 - 自带一个 Web 管理面板，可配置监控目标、编辑 YAML、查看收件箱和日志。
 
 项目为单文件应用，适合个人服务器、NAT 小鸡、轻量 VPS 直接用 systemd 跑。
@@ -28,6 +29,17 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 请克隆 `https://github.com/GongyiChuren/tg-watchbot.git` 到本机，默认使用 Docker 按 README 的 `Docker 安装（含自启）` 启动服务；若无 Docker，则按 `快速开始` 走 Python 和 systemd 部署直接安装。启动后打开 `http://127.0.0.1:8765`，安装完成后提醒用户记得在面板填写 `TELEGRAM_BOT_TOKEN` 和 `ADMIN_CHAT_ID` 并在之后保存并执行重启（Docker 用 `docker compose restart`，直接安装用重启进程）。
 ``` 
 ## 更新日志
+
+### 2026-05-28 更新
+
+- 新增「频道媒体转发」：使用 Telethon 用户账号登录 TG，实时转发群组/频道消息到你的 Telegram。
+- 面板新增「频道媒体」页面：搜索已加入群组，一键添加转发监控。
+- 支持暂停/恢复监控（保留配置）、删除监控。
+- 支持关键词过滤：只转发包含特定关键词的消息，留空则转发全部。
+- 支持媒体类型过滤：可选视频、文档、图片、音频。
+- 支持 SOCKS5/HTTP 代理，适合国内服务器。
+- 内置下载到服务器、断点续传、并发下载等功能，后续可通过配置开启。
+- 需要在设置页填写 `TG_API_ID`、`TG_API_HASH`、`TG_API_SESSION` 后使用。
 
 ### 2026-05-22 更新
 
@@ -100,6 +112,21 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 默认最低监控间隔为 60 秒。
 
 ![示例图片](https://pic.gongyichuren.de/file/1779287170665_17b7c8b4040d6334ea62a108d08db644.png)
+
+### 频道媒体下载
+
+- 使用 Telethon 用户账号（非 Bot）登录 Telegram，可访问已加入的所有频道和群组。
+- 面板「频道媒体」页面支持搜索已加入的群组/频道，一键添加监控。
+- 支持暂停/恢复监控（保留配置）、删除监控。
+- 支持实时自动下载新消息中的媒体，也支持手动触发下载历史媒体。
+- 支持断点续传：大文件下载中断后自动续传，不重复下载。
+- 支持并发下载控制：可设置同时下载数（1-10，默认 3）。
+- 支持 SOCKS5/HTTP 代理，适合国内服务器使用。
+- 支持按日期范围过滤：只下载指定时间段内的消息。
+- 支持关键词过滤、媒体类型选择（视频/文档/图片/音频）、文件大小限制。
+- 支持实时转发模式：群消息匹配后直接转发到你的 Telegram（含视频/文档原文），无需下载到服务器。
+- 下载完成可自动推送 Telegram 通知给管理员。
+- 需要在设置页填写 `TG_API_ID`、`TG_API_HASH`、`TG_API_SESSION`。
 
 ### Web 管理面板
 
@@ -490,6 +517,11 @@ monitors:
 | `/rules` | 私聊广告拦截规则 |
 | `/replies` | 快捷回复模板 |
 | `/monitor/events` | 监控推送历史 |
+| `/channel-media` | 频道媒体监控 |
+| `/channel-media/{id}/pause` | 暂停频道监控 |
+| `/channel-media/{id}/resume` | 恢复频道监控 |
+| `/channel-media/{id}/check` | 手动下载频道媒体 |
+| `/channel-media/{id}/download` | 查看下载记录 |
 | `/config/export` | 导出 / 导入 `config.yaml` |
 | `/logs` | 日志 |
 | `/health` | 健康检查 |
