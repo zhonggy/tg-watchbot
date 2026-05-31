@@ -3529,8 +3529,16 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         bot_ready = bool(v["TELEGRAM_BOT_TOKEN"].strip() and v["ADMIN_CHAT_ID"].strip())
         status = "" if bot_ready else "<div class=msg>未填写 Token 或管理员 ID；网页可用，但 Bot 和监控推送不可用。</div>"
         login_row = telegram_login_status_row()
-        login_status = "已登录" if login_row.get("status") == "authorized" else "未登录"
-        login_user = login_row.get("username") or login_row.get("phone") or login_row.get("user_id") or "-"
+        env_session = v.get("TG_API_SESSION", "").strip()
+        if login_row.get("status") == "authorized":
+            login_status = "已登录"
+            login_user = login_row.get("username") or login_row.get("phone") or login_row.get("user_id") or "-"
+        elif env_session:
+            login_status = "已配置（手动填入）"
+            login_user = env_session[:16] + "..."
+        else:
+            login_status = "未登录"
+            login_user = "-"
         body = f"""<h2>设置向导</h2>{status}<div class=card><form method=post>
 <div class=step><div class=step-title><span class=step-no>1</span><span>Bot 基础配置</span></div>
 <p class=muted>先保证 Bot 能给管理员发通知。</p>
