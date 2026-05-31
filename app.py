@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import html
+import io
 import logging
 import os
 import re
@@ -32,6 +34,7 @@ import os.path as ospath
 import feedparser
 import httpx
 import yaml
+import qrcode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -81,6 +84,7 @@ scheduler_ref: AsyncIOScheduler | None = None
 user_session_listener_task: asyncio.Task | None = None
 user_session_client: Any = None
 channel_media_clients: dict[str, Any] = {}
+telegram_qr_logins: dict[str, dict[str, Any]] = {}
 GROUP_SUMMARY_MAX_CHARS = 800
 
 
@@ -225,6 +229,19 @@ def init_db() -> None:
                 meta_value TEXT,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS telegram_login_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_name TEXT NOT NULL DEFAULT 'default',
+                api_id TEXT NOT NULL DEFAULT '',
+                api_hash TEXT NOT NULL DEFAULT '',
+                tg_session TEXT NOT NULL DEFAULT '',
+                phone TEXT DEFAULT '',
+                username TEXT DEFAULT '',
+                user_id TEXT DEFAULT '',
+                status TEXT DEFAULT 'empty',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS discovered_group_chats (
                 chat_id INTEGER PRIMARY KEY,
                 title TEXT,
@@ -281,6 +298,10 @@ def init_db() -> None:
             "ALTER TABLE channel_media_monitors ADD COLUMN max_concurrent INTEGER DEFAULT 3",
             "ALTER TABLE channel_media_monitors ADD COLUMN forward_mode INTEGER DEFAULT 0",
             "ALTER TABLE channel_media_monitors ADD COLUMN forward_to TEXT DEFAULT 'admin'",
+            "ALTER TABLE telegram_login_sessions ADD COLUMN username TEXT DEFAULT ''",
+            "ALTER TABLE telegram_login_sessions ADD COLUMN user_id TEXT DEFAULT ''",
+            "ALTER TABLE telegram_login_sessions ADD COLUMN phone TEXT DEFAULT ''",
+            "ALTER TABLE telegram_login_sessions ADD COLUMN status TEXT DEFAULT 'empty'",
         ]:
             try:
                 conn.execute(sql)
@@ -568,6 +589,14 @@ def user_session_config() -> tuple[str, str, str]:
     api_id = os.getenv("TG_API_ID", "").strip()
     api_hash = os.getenv("TG_API_HASH", "").strip()
     session = os.getenv("TG_API_SESSION", "").strip()
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT api_id, api_hash, tg_session FROM telegram_login_sessions WHERE session_name='default' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if row:
+        api_id = str(row["api_id"] or api_id).strip()
+        api_hash = str(row["api_hash"] or api_hash).strip()
+        session = str(row["tg_session"] or session).strip()
     return api_id, api_hash, session
 
 
@@ -582,6 +611,91 @@ def user_session_ready() -> bool:
     except Exception:
         return False
     return True
+
+
+def telegram_login_status_row() -> dict[str, str]:
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT * FROM telegram_login_sessions WHERE session_name='default' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if not row:
+        return {"status": "empty", "username": "", "phone": "", "user_id": ""}
+    return {k: str(row[k] or "") for k in row.keys()}
+
+
+def save_telegram_login_session(api_id: str, api_hash: str, tg_session: str, phone: str = "", username: str = "", user_id: str = "") -> None:
+    ts = now_iso()
+    with closing(db()) as conn:
+        conn.execute(
+            "DELETE FROM telegram_login_sessions WHERE session_name='default'"
+        )
+        conn.execute(
+            """INSERT INTO telegram_login_sessions(session_name, api_id, api_hash, tg_session, phone, username, user_id, status, created_at, updated_at)
+            VALUES('default',?,?,?,?,?,?, 'authorized', ?, ?)""",
+            (api_id, api_hash, tg_session, phone, username, user_id, ts, ts),
+        )
+        conn.commit()
+
+
+def clear_telegram_login_session() -> None:
+    with closing(db()) as conn:
+        conn.execute("DELETE FROM telegram_login_sessions WHERE session_name='default'")
+        conn.commit()
+
+
+async def telegram_login_prepare_qr() -> dict[str, Any]:
+    if TelegramClient is None or StringSession is None:
+        return {"ok": False, "error": "telethon not installed"}
+    api_id = os.getenv("TG_API_ID", "").strip()
+    api_hash = os.getenv("TG_API_HASH", "").strip()
+    if not api_id or not api_hash:
+        return {"ok": False, "error": "missing TG_API_ID / TG_API_HASH"}
+    try:
+        api_id_int = int(api_id)
+    except Exception:
+        return {"ok": False, "error": "TG_API_ID must be int"}
+    client = TelegramClient(StringSession(), api_id_int, api_hash)
+    try:
+        await client.connect()
+        qr_login = await client.qr_login()
+        qr_svg = qrcode.make(qr_login.url)
+        buffer = io.BytesIO()
+        qr_svg.save(buffer, format="PNG")
+        qr_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return {
+            "ok": True,
+            "url": qr_login.url,
+            "qr_png": f"data:image/png;base64,{qr_b64}",
+            "client": client,
+            "login": qr_login,
+        }
+    except Exception as e:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return {"ok": False, "error": str(e)}
+
+
+async def telegram_login_complete(client: Any, login: Any) -> dict[str, Any]:
+    await login.wait()
+    session_str = client.session.save() if hasattr(client.session, "save") else ""
+    me = await client.get_me()
+    save_telegram_login_session(
+        os.getenv("TG_API_ID", "").strip(),
+        os.getenv("TG_API_HASH", "").strip(),
+        session_str,
+        phone=str(getattr(me, "phone", "") or ""),
+        username=str(getattr(me, "username", "") or ""),
+        user_id=str(getattr(me, "id", "") or ""),
+    )
+    await client.disconnect()
+    return {
+        "ok": True,
+        "username": str(getattr(me, "username", "") or ""),
+        "phone": str(getattr(me, "phone", "") or ""),
+        "user_id": str(getattr(me, "id", "") or ""),
+    }
 
 
 # ---- Channel Media Download (Telethon user session) ----
@@ -2824,6 +2938,9 @@ th{{color:var(--ink);font-size:12px;background:var(--yellow);text-transform:uppe
 tr:nth-child(even) td{{background:#fafafa}}
 .badge{{padding:4px 8px;border:3px solid var(--ink);border-radius:999px;background:var(--blue);color:white;font-size:12px;font-weight:900;text-transform:uppercase}}
 .msg{{padding:11px 12px;border:3px solid var(--ink);background:var(--yellow);color:var(--ink);margin:10px 0;font-weight:900;box-shadow:4px 4px 0 var(--ink)}}
+.step{{border:3px solid var(--ink);background:#fff;padding:14px;margin:14px 0;box-shadow:4px 4px 0 var(--ink)}}
+.step-title{{display:flex;align-items:center;gap:10px;margin:0 0 10px;font-size:18px;font-weight:900}}
+.step-no{{display:inline-grid;place-items:center;width:30px;height:30px;border:3px solid var(--ink);background:var(--yellow);font-weight:900}}
 pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px solid var(--ink);max-height:420px;overflow:auto;box-shadow:5px 5px 0 var(--yellow)}}
 .friend-links{{margin-top:18px;padding-top:12px;border-top:3px solid var(--ink);display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
 .friend-links b{{font-size:12px;font-weight:900;text-transform:uppercase}}
@@ -2842,7 +2959,7 @@ pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px 
 @media (prefers-reduced-motion: reduce){{
   *,*::before,*::after{{animation:none!important;transition:none!important}}
 }}
-</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>消息</b><a href='/inbox'>收件箱</a><a href='/users'>用户管理</a><a href='/send'>主动发消息</a><a href='/replies'>快捷回复</a><a href='/rules'>私聊广告拦截</a></section><section><b>监控</b><a href='/'>监控面板</a><a href='/monitor/new'>新增监控</a><a href='/group-monitors'>TG 群监听</a><a href='/channel-media'>频道媒体</a><a href='/monitor/events'>推送历史</a><a href='/run-once'>手动检查</a></section><section><b>配置</b><a href='/settings'>Bot / 面板设置</a><a href='/yaml'>YAML 高级编辑</a><a href='/config/export'>导出配置</a></section><section><b>系统</b><a href='/update'>更新代码</a><a href='/logs'>运行日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启机器人</a><a class=logout href='/logout'>退出登录</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
+</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>常用</b><a href='/'>总览</a><a href='/inbox'>收件箱</a><a href='/users'>用户</a><a href='/send'>发消息</a></section><section><b>转发</b><a href='/group-monitors'>群监听</a><a href='/channel-media'>频道媒体</a><a href='/monitor/events'>历史</a></section><section><b>设置</b><a href='/settings'>面板设置</a><a href='/yaml'>YAML</a><a href='/config/export'>导入导出</a></section><section><b>系统</b><a href='/update'>更新</a><a href='/logs'>日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启</a><a class=logout href='/logout'>退出</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
 {body}<div class=friend-links><b>友链</b><a href='https://linux.do' target='_blank' rel='noopener noreferrer'>Linux.do</a><span>·</span><a href='https://www.nodeseek.com' target='_blank' rel='noopener noreferrer'>NodeSeek</a></div></main></div></body></html>"""
 
 
@@ -3081,7 +3198,7 @@ def create_panel_app() -> FastAPI:
         ai_prompt: str,
         ai_min_interval_seconds: str,
         ai_dedupe_window_seconds: str,
-    ) -> RedirectResponse | HTMLResponse:
+    ) -> Response:
         cfg = cfg_load_fresh()
         rows = cfg.setdefault("group_monitors", [])
         if not isinstance(rows, list):
@@ -3147,7 +3264,7 @@ def create_panel_app() -> FastAPI:
         ai_prompt: str = Form(""),
         ai_min_interval_seconds: str = Form(str(DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS)),
         ai_dedupe_window_seconds: str = Form(str(DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS)),
-    ) -> RedirectResponse | HTMLResponse:
+    ) -> Response:
         return await save_group_monitor_common(
             None,
             name,
@@ -3190,7 +3307,7 @@ def create_panel_app() -> FastAPI:
         ai_prompt: str = Form(""),
         ai_min_interval_seconds: str = Form(str(DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS)),
         ai_dedupe_window_seconds: str = Form(str(DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS)),
-    ) -> RedirectResponse | HTMLResponse:
+    ) -> Response:
         return await save_group_monitor_common(
             original_index,
             name,
@@ -3387,15 +3504,56 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         cleanup = (cfg_load_fresh().get("cleanup") or {})
         bot_ready = bool(v["TELEGRAM_BOT_TOKEN"].strip() and v["ADMIN_CHAT_ID"].strip())
         status = "" if bot_ready else "<div class=msg>未填写 Token 或管理员 ID；网页可用，但 Bot 和监控推送不可用。</div>"
-        body = f"""<h2>Bot / 面板设置</h2>{status}<div class=card><form method=post>
-<label>Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='123456:ABC...'>
-<label>管理员 ADMIN_CHAT_ID（最多 3 个，用逗号分隔）</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}'>
-<h3>TG 用户会话（可选）</h3><p class=muted>仅用于“TG 群监听 -> 监听来源=用户会话”，适合 Bot 无法加入的群。填写后需重启。</p>
+        login_row = telegram_login_status_row()
+        login_status = "已登录" if login_row.get("status") == "authorized" else "未登录"
+        login_user = login_row.get("username") or login_row.get("phone") or login_row.get("user_id") or "-"
+        body = f"""<h2>设置向导</h2>{status}<div class=card><form method=post>
+<div class=step><div class=step-title><span class=step-no>1</span><span>Bot 基础配置</span></div>
+<p class=muted>先保证 Bot 能给管理员发通知。</p>
+<div class=grid><div><label>Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='123456:ABC...'></div><div><label>管理员 ADMIN_CHAT_ID</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}' placeholder='最多 3 个，用逗号分隔'></div></div>
+</div>
+<div class=step><div class=step-title><span class=step-no>2</span><span>TG 用户会话登录</span></div>
+<p class=muted>用于频道媒体转发。先填 TG_API_ID / TG_API_HASH 并保存，再点二维码登录。</p>
 <div class=grid><div><label>TG_API_ID</label><input name=TG_API_ID value='{html_escape(v['TG_API_ID'])}' placeholder='例如 12345678'></div><div><label>TG_API_HASH</label><input name=TG_API_HASH value='{html_escape(v['TG_API_HASH'])}' placeholder='32位哈希'></div></div>
-<label>TG_API_SESSION</label><textarea name=TG_API_SESSION placeholder='Telethon StringSession'>{html_escape(v['TG_API_SESSION'])}</textarea>
+<label>TG_API_SESSION（可选，二维码登录会自动生成保存）</label><textarea name=TG_API_SESSION placeholder='Telethon StringSession'>{html_escape(v['TG_API_SESSION'])}</textarea>
+<div class=msg id=tgLoginBox>登录状态：<b>{html_escape(login_status)}</b> · 账号：<code>{html_escape(login_user)}</code></div>
+<div class=actions><button class='btn ok' type=button onclick='startTgQrLogin()'>二维码登录</button><button class='btn danger' type=button onclick='logoutTgSession()'>登出会话</button></div>
+<div id=tgQrPanel class=step style='display:none'><div class=step-title><span class=step-no>QR</span><span>扫码登录 Telegram</span></div><p class=muted id=tgQrText>正在生成二维码...</p><div id=tgQrImage></div></div>
+</div>
+<div class=step><div class=step-title><span class=step-no>3</span><span>高级设置</span></div>
+<p class=muted>一般保持默认即可。</p>
 <div class=grid><div><label>日志级别</label><input name=LOG_LEVEL value='{html_escape(v['LOG_LEVEL'])}'></div><div><label>面板监听地址</label><input name=WEB_PANEL_HOST value='{html_escape(v['WEB_PANEL_HOST'])}'></div><div><label>面板端口</label><input name=WEB_PANEL_PORT value='{html_escape(v['WEB_PANEL_PORT'])}'></div><div><label>面板用户</label><input name=WEB_PANEL_USER value='{html_escape(v['WEB_PANEL_USER'])}'></div><div><label>面板密码</label><input name=WEB_PANEL_PASSWORD value='{html_escape(v['WEB_PANEL_PASSWORD'])}'></div></div>
-<h3>监控数据自动清理</h3><p class=muted>删除过期监控通知消息，并清理 RSS/网站监控状态和去重记录；不会删除用户、收件箱、双向对话消息。</p><div class=grid><div><label>清理间隔（分钟）</label><input name=CLEANUP_INTERVAL_MINUTES type=number min=1 value='{html_escape(cleanup.get("interval_minutes", 60))}'></div><div><label>监控通知删除时间（分钟）</label><input name=CLEANUP_MESSAGE_DELETE_AFTER_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_message_delete_after_minutes", 60))}'></div><div><label>保留监控数据（分钟）</label><input name=CLEANUP_RETENTION_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_retention_minutes", 1440))}'></div></div>
-<input type=hidden name=WEB_PANEL_ENABLED value='true'><div class=form-actions><button class='btn primary' type=submit>保存设置</button></div><small>改 Token、管理员 ID 或端口后需要重启。</small></form></div>"""
+<h3>自动清理</h3><div class=grid><div><label>清理间隔（分钟）</label><input name=CLEANUP_INTERVAL_MINUTES type=number min=1 value='{html_escape(cleanup.get("interval_minutes", 60))}'></div><div><label>通知删除时间（分钟）</label><input name=CLEANUP_MESSAGE_DELETE_AFTER_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_message_delete_after_minutes", 60))}'></div><div><label>保留监控数据（分钟）</label><input name=CLEANUP_RETENTION_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_retention_minutes", 1440))}'></div></div>
+</div>
+<input type=hidden name=WEB_PANEL_ENABLED value='true'><div class=form-actions><button class='btn primary' type=submit>保存设置</button></div><small>改 Token、管理员 ID、端口或 TG_API_ID / TG_API_HASH 后需要保存并重启。</small></form></div>
+<script>
+async function startTgQrLogin() {{
+  const panel = document.getElementById('tgQrPanel');
+  const text = document.getElementById('tgQrText');
+  const img = document.getElementById('tgQrImage');
+  panel.style.display='block'; text.textContent='正在生成二维码...'; img.innerHTML='';
+  const r = await fetch('/api/tg-login/qr', {{method:'POST'}});
+  const data = await r.json();
+  if (!data.ok) {{ text.textContent='生成失败：' + (data.error || 'unknown'); return; }}
+  img.innerHTML = '<img style="width:240px;height:240px;border:4px solid #121212" src="' + data.qr_png + '">';
+  text.textContent='请用 Telegram 手机端扫码，二维码 60 秒后过期。';
+  pollTgLogin(data.login_id, 0);
+}}
+async function pollTgLogin(id, n) {{
+  const text = document.getElementById('tgQrText');
+  if (n > 60) {{ text.textContent='二维码已过期，请重新点击登录。'; return; }}
+  const r = await fetch('/api/tg-login/status?login_id=' + encodeURIComponent(id));
+  const data = await r.json();
+  if (data.ok && data.status === 'authorized') {{ text.textContent='登录成功，正在刷新...'; setTimeout(()=>location.reload(), 800); return; }}
+  if (data.status === 'error') {{ text.textContent='登录失败：' + (data.error || 'unknown'); return; }}
+  setTimeout(()=>pollTgLogin(id, n+2), 2000);
+}}
+async function logoutTgSession() {{
+  if (!confirm('确定登出 TG 用户会话？')) return;
+  const r = await fetch('/api/tg-login/logout', {{method:'POST'}});
+  if (r.ok) location.reload();
+}}
+</script>"""
         return layout("设置", body)
 
     def save_panel_settings(
@@ -3555,6 +3713,53 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
             int(cleanup.get("monitor_retention_minutes", 1440)),
         )
         return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token、管理员 ID、端口、账号或密码后请重启。</div><p><a class=btn href='/users'>返回用户管理</a> <a class=btn href='/restart'>重启机器人</a></p>")
+
+    @app.post("/api/tg-login/qr")
+    async def api_tg_login_qr(_: str = Depends(panel_auth)) -> dict[str, Any]:
+        result = await telegram_login_prepare_qr()
+        if not result.get("ok"):
+            return {"ok": False, "error": result.get("error", "failed")}
+        login_id = secrets.token_urlsafe(8)
+        telegram_qr_logins[login_id] = {
+            "client": result["client"],
+            "login": result["login"],
+            "created_at": time.time(),
+            "status": "pending",
+        }
+        async def waiter():
+            try:
+                data = await telegram_login_complete(result["client"], result["login"])
+                telegram_qr_logins[login_id]["status"] = "authorized"
+                telegram_qr_logins[login_id]["result"] = data
+            except Exception as e:
+                telegram_qr_logins[login_id]["status"] = "error"
+                telegram_qr_logins[login_id]["error"] = str(e)
+        asyncio.create_task(waiter())
+        return {"ok": True, "login_id": login_id, "qr_png": result["qr_png"]}
+
+    @app.get("/api/tg-login/status")
+    async def api_tg_login_status(_: str = Depends(panel_auth), login_id: str = "") -> dict[str, Any]:
+        item = telegram_qr_logins.get(login_id)
+        if not item:
+            return {"ok": False, "status": "missing"}
+        status = item.get("status", "pending")
+        if time.time() - float(item.get("created_at", 0)) > 120:
+            item["status"] = "expired"
+            status = "expired"
+        result = item.get("result", {})
+        return {
+            "ok": True,
+            "status": status,
+            "error": item.get("error", ""),
+            "username": result.get("username", ""),
+            "phone": result.get("phone", ""),
+            "user_id": result.get("user_id", ""),
+        }
+
+    @app.post("/api/tg-login/logout")
+    async def api_tg_login_logout(_: str = Depends(panel_auth)) -> dict[str, Any]:
+        clear_telegram_login_session()
+        return {"ok": True}
 
     @app.post("/users/{user_id}/note")
     async def user_note_save(user_id: int, _: str = Depends(panel_auth), note: str = Form("")) -> RedirectResponse:
