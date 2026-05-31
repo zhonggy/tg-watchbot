@@ -38,8 +38,9 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 支持关键词过滤：只转发包含特定关键词的消息，留空则转发全部。
 - 支持媒体类型过滤：可选视频、文档、图片、音频。
 - 支持 SOCKS5/HTTP 代理，适合国内服务器。
+- 新增 Telegram 二维码登录：设置页填写 `TG_API_ID` / `TG_API_HASH` 后，可扫码生成并保存用户会话。
 - 内置下载到服务器、断点续传、并发下载等功能，后续可通过配置开启。
-- 需要在设置页填写 `TG_API_ID`、`TG_API_HASH`、`TG_API_SESSION` 后使用。
+- 仍兼容手动填写 `TG_API_SESSION`。
 
 ### 2026-05-22 更新
 
@@ -126,7 +127,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 支持关键词过滤、媒体类型选择（视频/文档/图片/音频）、文件大小限制。
 - 支持实时转发模式：群消息匹配后直接转发到你的 Telegram（含视频/文档原文），无需下载到服务器。
 - 下载完成可自动推送 Telegram 通知给管理员。
-- 需要在设置页填写 `TG_API_ID`、`TG_API_HASH`、`TG_API_SESSION`。
+- 需要在设置页填写 `TG_API_ID`、`TG_API_HASH`，然后扫码登录；也兼容手动填写 `TG_API_SESSION`。
 
 ### Web 管理面板
 
