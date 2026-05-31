@@ -643,7 +643,24 @@ def clear_telegram_login_session() -> None:
         conn.commit()
 
 
-async def telegram_login_prepare_qr() -> dict[str, Any]:
+def _build_telethon_proxy(proxy: str) -> Any:
+    """Build Telethon proxy argument from a proxy string."""
+    if not proxy:
+        return None
+    p = proxy.strip()
+    if p.startswith("socks5://") or p.startswith("socks4://"):
+        try:
+            import socks
+            parts = p.replace("socks5://", "").replace("socks4://", "").split(":")
+            return (socks.SOCKS5 if "socks5" in p else socks.SOCKS4,
+                    parts[0], int(parts[1]) if len(parts) > 1 else 1080)
+        except ImportError:
+            logger.warning("pysocks not installed, cannot use socks proxy")
+            return None
+    return p
+
+
+async def telegram_login_prepare_qr(proxy: str = "") -> dict[str, Any]:
     if TelegramClient is None or StringSession is None:
         return {"ok": False, "error": "telethon not installed"}
     api_id = os.getenv("TG_API_ID", "").strip()
@@ -654,7 +671,8 @@ async def telegram_login_prepare_qr() -> dict[str, Any]:
         api_id_int = int(api_id)
     except Exception:
         return {"ok": False, "error": "TG_API_ID must be int"}
-    client = TelegramClient(StringSession(), api_id_int, api_hash)
+    proxy_arg = _build_telethon_proxy(proxy or os.getenv("TG_PROXY", "").strip())
+    client = TelegramClient(StringSession(), api_id_int, api_hash, proxy=proxy_arg)
     try:
         await client.connect()
         qr_login = await client.qr_login()
@@ -2639,6 +2657,7 @@ def env_values() -> dict[str, str]:
         "TG_API_ID": os.getenv("TG_API_ID", ""),
         "TG_API_HASH": os.getenv("TG_API_HASH", ""),
         "TG_API_SESSION": os.getenv("TG_API_SESSION", ""),
+        "TG_PROXY": os.getenv("TG_PROXY", ""),
     }
 
 
@@ -2666,6 +2685,7 @@ def write_env_values(values: dict[str, str]) -> None:
         f"TG_API_ID={values.get('TG_API_ID','')}",
         f"TG_API_HASH={values.get('TG_API_HASH','')}",
         f"TG_API_SESSION={values.get('TG_API_SESSION','')}",
+        f"TG_PROXY={values.get('TG_PROXY','')}",
         "",
     ]
     ENV_PATH.write_text("\n".join(lines), encoding="utf-8")
@@ -3516,6 +3536,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
 <p class=muted>用于频道媒体转发。先填 TG_API_ID / TG_API_HASH 并保存，再点二维码登录。</p>
 <div class=grid><div><label>TG_API_ID</label><input name=TG_API_ID value='{html_escape(v['TG_API_ID'])}' placeholder='例如 12345678'></div><div><label>TG_API_HASH</label><input name=TG_API_HASH value='{html_escape(v['TG_API_HASH'])}' placeholder='32位哈希'></div></div>
 <label>TG_API_SESSION（可选，二维码登录会自动生成保存）</label><textarea name=TG_API_SESSION placeholder='Telethon StringSession'>{html_escape(v['TG_API_SESSION'])}</textarea>
+<label>TG 代理（可选，国内服务器需要，例如 socks5://127.0.0.1:1080 或 http://127.0.0.1:7890）</label><input name=TG_PROXY value='{html_escape(v['TG_PROXY'])}' placeholder='留空则直连'>
 <div class=msg id=tgLoginBox>登录状态：<b>{html_escape(login_status)}</b> · 账号：<code>{html_escape(login_user)}</code></div>
 <div class=actions><button class='btn ok' type=button onclick='startTgQrLogin()'>二维码登录</button><button class='btn danger' type=button onclick='logoutTgSession()'>登出会话</button></div>
 <div id=tgQrPanel class=step style='display:none'><div class=step-title><span class=step-no>QR</span><span>扫码登录 Telegram</span></div><p class=muted id=tgQrText>正在生成二维码...</p><div id=tgQrImage></div></div>
@@ -3573,7 +3594,7 @@ async function logoutTgSession() {{
         cfg_save(cfg)
 
     @app.post("/settings", response_class=HTMLResponse)
-    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
+    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), TG_PROXY: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
         save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES)
         return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
 
@@ -3704,7 +3725,7 @@ async function logoutTgSession() {{
         return layout("用户管理", body)
 
     @app.post("/users/settings", response_class=HTMLResponse)
-    async def users_settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin")) -> str:
+    async def users_settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), TG_PROXY: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin")) -> str:
         cleanup = (cfg_load_fresh().get("cleanup") or {})
         save_panel_settings(
             locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED},
@@ -3716,7 +3737,7 @@ async function logoutTgSession() {{
 
     @app.post("/api/tg-login/qr")
     async def api_tg_login_qr(_: str = Depends(panel_auth)) -> dict[str, Any]:
-        result = await telegram_login_prepare_qr()
+        result = await telegram_login_prepare_qr(proxy=os.getenv("TG_PROXY", "").strip())
         if not result.get("ok"):
             return {"ok": False, "error": result.get("error", "failed")}
         login_id = secrets.token_urlsafe(8)
