@@ -657,6 +657,10 @@ def _build_telethon_proxy(proxy: str) -> Any:
         except ImportError:
             logger.warning("pysocks not installed, cannot use socks proxy")
             return None
+    if p.startswith("http://") or p.startswith("https://"):
+        from urllib.parse import urlparse
+        u = urlparse(p)
+        return {"proxy_type": "http", "addr": u.hostname, "port": u.port, "username": u.username, "password": u.password}
     return p
 
 
