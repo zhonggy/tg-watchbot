@@ -1014,92 +1014,6 @@ async def channel_media_monitor_loop() -> None:
             await disconnect_channel_media_client()
 
 
-async def channel_media_forward_listener() -> None:
-    """Real-time listener: forward messages from monitored groups to admin Telegram."""
-    if TelegramClient is None or StringSession is None:
-        logger.info("channel media forward listener skipped: telethon not installed")
-        return
-    api_id_raw, api_hash, session = user_session_config()
-    if not api_id_raw or not api_hash or not session:
-        logger.info("channel media forward listener skipped: user session not configured")
-        return
-    try:
-        api_id = int(api_id_raw)
-    except Exception:
-        return
-    try:
-        client = TelegramClient(StringSession(session), api_id, api_hash)
-
-        def _get_forward_monitors() -> dict[int, dict[str, Any]]:
-            monitors = channel_media_monitors_all()
-            result = {}
-            for m in monitors:
-                if m.get("status") != "active" or not m.get("forward_mode"):
-                    continue
-                try:
-                    cid = int(m["channel_id"])
-                    result[cid] = m
-                except (TypeError, ValueError):
-                    continue
-            return result
-
-        @client.on(events.NewMessage(incoming=True))
-        async def on_new_message_for_forward(event: Any) -> None:
-            try:
-                chat_id = getattr(event, "chat_id", None)
-                if chat_id is None:
-                    return
-                fwd_monitors = _get_forward_monitors()
-                monitor = fwd_monitors.get(int(chat_id))
-                if not monitor:
-                    return
-                msg = event.message
-                text = (msg.text or "") + " " + (msg.caption or "")
-                # Keyword filter
-                keywords_str = str(monitor.get("keywords") or "").strip()
-                if keywords_str:
-                    keywords_list = [k.strip() for k in keywords_str.split(",") if k.strip()]
-                    if keywords_list and not any(k.lower() in text.lower() for k in keywords_list):
-                        return
-                # Media type filter
-                media_types_str = str(monitor.get("media_types") or "").strip()
-                if media_types_str:
-                    allowed = {t.strip().lower() for t in media_types_str.split(",") if t.strip()}
-                    if allowed and not msg.media:
-                        has_text_only = bool(text.strip())
-                        if not has_text_only:
-                            return
-                # Determine forward target
-                forward_to = str(monitor.get("forward_to") or "admin").strip()
-                if forward_to == "admin":
-                    targets = all_admin_chat_ids()
-                elif forward_to == "saved":
-                    targets = ["me"]
-                else:
-                    try:
-                        targets = [int(forward_to)]
-                    except (TypeError, ValueError):
-                        targets = all_admin_chat_ids()
-                # Forward the message
-                for target in targets:
-                    try:
-                        await msg.forward_to(target)
-                    except Exception:
-                        logger.exception("forward failed target=%s msg_id=%s", target, msg.id)
-                logger.info("forwarded message from chat=%s msg_id=%s to %s", chat_id, msg.id, targets)
-            except Exception:
-                logger.exception("on_new_message_for_forward error")
-
-        await client.start()
-        logger.info("channel media forward listener started")
-        await client.run_until_disconnected()
-    except asyncio.CancelledError:
-        logger.info("channel media forward listener cancelled")
-        raise
-    except Exception:
-        logger.exception("channel media forward listener crashed")
-
-
 async def telethon_download_from_channel(monitor_id: int, download_history: bool = False) -> int:
     monitor = channel_media_monitor_get(monitor_id)
     if not monitor:
@@ -1162,7 +1076,7 @@ async def telethon_download_from_channel(monitor_id: int, download_history: bool
             if channel_media_download_exists(channel_id, message.id):
                 continue
             if keywords_list:
-                msg_text = (message.text or "") + " " + (message.caption or "")
+                msg_text = (message.message or getattr(message, "text", "") or "")[:500]
                 if not any(k.lower() in msg_text.lower() for k in keywords_list):
                     continue
             media = message.media
@@ -1185,7 +1099,7 @@ async def telethon_download_from_channel(monitor_id: int, download_history: bool
         async def download_one(msg: Any, mt: str, fs: int) -> tuple[int, int]:
             nonlocal count, total_size_added
             async with semaphore:
-                caption = (msg.text or msg.caption or "")[:500]
+                caption = (msg.message or getattr(msg, "text", "") or "")[:500]
                 sender_id = msg.sender_id or 0
                 file_name = ""
                 for attr in (getattr(getattr(msg.media, "document", None), "attributes", None) or []):
@@ -1588,13 +1502,34 @@ async def run_user_session_group_listener() -> None:
         client = TelegramClient(StringSession(session), api_id, api_hash)
         user_session_client = client
 
-        @client.on(events.NewMessage(incoming=True))  # type: ignore[misc]
+        @client.on(events.NewMessage)  # type: ignore[misc]
         async def on_new_group_message(event: Any) -> None:
-            if not (getattr(event, "is_group", False) or getattr(event, "is_channel", False)):
+            chat_id = getattr(event, "chat_id", None)
+            if chat_id is None:
                 return
+            cid = int(chat_id)
+            msg = event.message
+            # ---- group monitor (keywords) ----
+            from_cfg = group_monitors()
+            cfg_chat_ids = {int(m["chat_id"]) for m in from_cfg if m.get("enabled")}
+            if cid in cfg_chat_ids:
+                pseudo = build_pseudo_message_from_user_session_event(event)
+                if pseudo is not None:
+                    text_preview = (getattr(pseudo, "text", "") or "")[:80]
+                    logger.info("user_session: msg chat=%s title=%s text=%s", pseudo.chat.id, getattr(pseudo.chat, "title", ""), text_preview)
+                    record_discovered_group_chat_data(
+                        int(pseudo.chat.id),
+                        str(getattr(pseudo.chat, "title", "") or pseudo.chat.id),
+                        str(getattr(pseudo.chat, "username", "") or ""),
+                    )
+                    await handle_group_keyword_message(pseudo, listen_source="user_session")
+
             pseudo = build_pseudo_message_from_user_session_event(event)
             if pseudo is None:
+                logger.debug("user_session: build_pseudo returned None for chat_id=%s", getattr(event, "chat_id", "?"))
                 return
+            text_preview = (getattr(pseudo, "text", "") or "")[:80]
+            logger.info("user_session: msg from chat=%s title=%s text=%s", pseudo.chat.id, getattr(pseudo.chat, "title", ""), text_preview)
             record_discovered_group_chat_data(
                 int(pseudo.chat.id),
                 str(getattr(pseudo.chat, "title", "") or pseudo.chat.id),
@@ -2920,7 +2855,7 @@ main{{padding:24px 30px;min-width:0;max-width:1440px;animation:mainIn .25s var(-
 nav{{display:grid;gap:13px}}
 nav section{{display:grid;gap:6px;padding:9px;border:3px solid var(--ink);background:#fff;box-shadow:3px 3px 0 var(--ink);transition:transform .18s var(--ease);contain:paint}}
 nav section:hover{{transform:translateY(-1px)}}
-nav section>b{{display:inline-block;width:max-content;margin:-20px 0 2px -2px;padding:3px 8px;border:3px solid var(--ink);background:var(--yellow);font-size:12px;font-weight:900;text-transform:uppercase}}
+nav section>b{{display:inline-block;width:max-content;margin:-12px 0 2px -2px;padding:3px 8px;border:3px solid var(--ink);background:var(--yellow);font-size:12px;font-weight:900;text-transform:uppercase}}
 nav a{{position:relative;padding:9px 10px;border:3px solid var(--ink);background:var(--white);color:var(--ink);font-weight:900;text-transform:uppercase;font-size:12px;box-shadow:2px 2px 0 var(--ink);transition:transform .14s var(--ease),box-shadow .14s var(--ease),background-color .14s var(--ease);will-change:transform}}
 nav section:nth-child(2)>b{{background:var(--blue);color:white}}
 nav section:nth-child(3)>b{{background:var(--red);color:white}}
@@ -2983,7 +2918,7 @@ pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px 
 @media (prefers-reduced-motion: reduce){{
   *,*::before,*::after{{animation:none!important;transition:none!important}}
 }}
-</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>常用</b><a href='/'>总览</a><a href='/inbox'>收件箱</a><a href='/users'>用户</a><a href='/send'>发消息</a></section><section><b>转发</b><a href='/group-monitors'>群监听</a><a href='/channel-media'>频道媒体</a><a href='/monitor/events'>历史</a></section><section><b>设置</b><a href='/settings'>面板设置</a><a href='/yaml'>YAML</a><a href='/config/export'>导入导出</a></section><section><b>系统</b><a href='/update'>更新</a><a href='/logs'>日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启</a><a class=logout href='/logout'>退出</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
+</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>常用</b><a href='/'>总览</a><a href='/inbox'>收件箱</a><a href='/users'>用户</a><a href='/send'>发消息</a></section><section><b>转发</b><a href='/group-monitors'>群监听</a><a href='/monitor/events'>历史</a></section><section><b>设置</b><a href='/settings'>面板设置</a><a href='/yaml'>YAML</a><a href='/config/export'>导入导出</a></section><section><b>系统</b><a href='/update'>更新</a><a href='/logs'>日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启</a><a class=logout href='/logout'>退出</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
 {body}<div class=friend-links><b>友链</b><a href='https://linux.do' target='_blank' rel='noopener noreferrer'>Linux.do</a><span>·</span><a href='https://www.nodeseek.com' target='_blank' rel='noopener noreferrer'>NodeSeek</a></div></main></div></body></html>"""
 
 
@@ -4313,11 +4248,7 @@ async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
             )
         else:
             user_session_listener_task = asyncio.create_task(run_user_session_group_listener())
-    if TelegramClient is not None and user_session_ready():
-        asyncio.create_task(channel_media_forward_listener())
-        logger.info("channel media forward listener started")
-    else:
-        logger.info("channel media forward listener skipped: telethon not installed or user session not configured")
+
     await admin_send(f"tg-watchbot 已启动\n时间：{now_iso()}")
     logger.info("bot polling start")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
