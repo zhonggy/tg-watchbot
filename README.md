@@ -100,6 +100,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
   - `/spamwords`：查看广告关键词；
   - `/spamadd <关键词>`：添加广告关键词；
   - `/spamdel <关键词>`：删除广告关键词；
+  - `/ai`：在 Telegram 内选择群组和时间窗口，AI 汇总该群最近消息；
   - `/cancel`：取消待发送图片。
 - 普通用户有简单限流，防止刷屏。
 - 支持最多 3 个管理员 chat id，用逗号分隔配置。
@@ -413,6 +414,8 @@ group_monitors:
 - `ai_dedupe_window_seconds`：相同内容摘要去重窗口（防重复）
 - 机器人想收到群里普通消息，需要在 `@BotFather` 执行 `/setprivacy` 关闭隐私模式。
 - 若使用 `listen_source=user_session`，需在设置页填写 `TG_API_ID`、`TG_API_HASH`、`TG_API_SESSION` 后重启。
+- 管理员可在 Telegram 私聊 Bot 发送 `/ai`，Bot 会列出已发现群组按钮；选择群组后再选择 `3/6/9/12/24/48` 小时时间窗口，随后 AI 汇总该群在对应时间内已记录的文本消息并推送给管理员。
+- `/ai` 汇总依赖本地数据库中已记录的群消息，只能汇总 Bot/用户会话监听运行期间收到的文本或带说明消息；未配置该群的 AI Base URL / API Key / Model 时，会提示先到 Web 面板创建/编辑群监听并填写 AI 配置。
 
 更新代码（`/update`）已支持安全检查：
 - 显示本地/远端 commit、ahead/behind、工作区是否干净

@@ -17,6 +17,27 @@ def install_import_stubs() -> None:
 
             return decorator
 
+        def callback_query(self, *args, **kwargs):
+            def decorator(func):
+                return func
+
+            return decorator
+
+    class DummyFilterField:
+        def startswith(self, *args, **kwargs):
+            return object()
+
+    class DummyF:
+        data = DummyFilterField()
+
+    class DummyInlineKeyboardButton:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class DummyInlineKeyboardMarkup:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
     def identity_factory(*args, **kwargs):
         return object()
 
@@ -43,16 +64,21 @@ def install_import_stubs() -> None:
     modules["apscheduler.schedulers.asyncio"].AsyncIOScheduler = object
     modules["bs4"].BeautifulSoup = object
     modules["dotenv"].load_dotenv = lambda *args, **kwargs: None
+    modules["qrcode"] = ModuleType("qrcode")
+    modules["qrcode"].make = lambda *args, **kwargs: SimpleNamespace(save=lambda *a, **k: None)
     modules["yaml"].safe_load = lambda stream: {"bot": {"spam_filter": {"enabled": True, "keywords": []}}}
     modules["yaml"].safe_dump = lambda data, **kwargs: str(data)
     modules["aiogram"].Bot = object
     modules["aiogram"].Dispatcher = object
-    modules["aiogram"].F = object()
+    modules["aiogram"].F = DummyF()
     modules["aiogram"].Router = DummyRouter
     modules["aiogram.enums"].ParseMode = SimpleNamespace(HTML="HTML")
     modules["aiogram.exceptions"].TelegramAPIError = Exception
     modules["aiogram.filters"].Command = identity_factory
     modules["aiogram.filters"].CommandObject = object
+    modules["aiogram.types"].CallbackQuery = object
+    modules["aiogram.types"].InlineKeyboardButton = DummyInlineKeyboardButton
+    modules["aiogram.types"].InlineKeyboardMarkup = DummyInlineKeyboardMarkup
     modules["aiogram.types"].Message = object
     modules["aiogram.client.default"].DefaultBotProperties = identity_factory
     modules["fastapi"].Depends = identity_factory
@@ -301,7 +327,7 @@ class PanelHtmlContractTest(unittest.TestCase):
 
     def test_layout_groups_navigation_by_domain(self) -> None:
         html = app.layout("测试", "<p>ok</p>")
-        for expected in ["<b>消息</b>", "<b>监控</b>", "<b>配置</b>", "<b>系统</b>", "私聊广告拦截", "TG 群监听"]:
+        for expected in ["<b>常用</b>", "<b>转发</b>", "<b>设置</b>", "<b>系统</b>", "群监听"]:
             self.assertIn(expected, html)
 
     def test_inbox_copy_describes_two_way_conversation(self) -> None:
@@ -337,6 +363,14 @@ class PanelHtmlContractTest(unittest.TestCase):
             "name=ai_dedupe_window_seconds",
         ]:
             self.assertIn(expected, html)
+
+    def test_group_digest_keyboard_uses_short_callback_data(self) -> None:
+        keyboard = app.group_digest_chat_keyboard([{"chat_id": -100123, "title": "测试群"}])
+        self.assertEqual("aidg:g:-100123", keyboard.inline_keyboard[0][0].callback_data)
+        hours = app.group_digest_hours_keyboard(-100123)
+        values = [button.callback_data for row in hours.inline_keyboard for button in row]
+        self.assertIn("aidg:t:-100123:3", values)
+        self.assertIn("aidg:t:-100123:48", values)
 
 
 class SpamAndTemplateConfigTest(unittest.TestCase):
@@ -457,6 +491,55 @@ class GroupMonitorTest(unittest.TestCase):
                 self.assertIn("dedupe", reason3)
             finally:
                 app.DB_PATH = old_db_path
+
+    def test_group_digest_message_records_and_filters_by_hours(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_db_path = app.DB_PATH
+            app.DB_PATH = Path(temp_dir) / "test.sqlite3"
+            app.init_db()
+            msg = SimpleNamespace(
+                chat=SimpleNamespace(id=-100100100, username="groupdemo", title="测试群"),
+                from_user=SimpleNamespace(id=123, first_name="Alice", last_name="", username="alice"),
+                text="第一条群消息",
+                caption=None,
+                reply_to_message=None,
+                message_id=777,
+                content_type="text",
+            )
+            try:
+                self.assertTrue(app.record_group_digest_message(msg, "bot"))
+                self.assertFalse(app.record_group_digest_message(msg, "bot"))
+                rows = app.list_group_digest_messages(-100100100, 3)
+                self.assertEqual(1, len(rows))
+                self.assertEqual("第一条群消息", rows[0]["text"])
+                with closing(app.db()) as conn:
+                    conn.execute("UPDATE group_digest_messages SET created_at_ts=?", (0,))
+                    conn.commit()
+                self.assertEqual([], app.list_group_digest_messages(-100100100, 3))
+            finally:
+                app.DB_PATH = old_db_path
+
+    def test_group_digest_ai_config_reuses_monitor_for_chat(self) -> None:
+        old_config = app.config
+        app.config = {
+            "group_monitors": [
+                {
+                    "enabled": True,
+                    "chat_id": -100100100,
+                    "keywords": [],
+                    "summary_mode": "ai",
+                    "ai_base_url": "https://api.example.com/v1",
+                    "ai_api_key": "sk-test",
+                    "ai_model": "gpt-4o-mini",
+                }
+            ]
+        }
+        try:
+            cfg = app.ai_config_for_group_chat(-100100100)
+            self.assertIsNotNone(cfg)
+            self.assertEqual("sk-test", cfg["ai_api_key"])
+        finally:
+            app.config = old_config
 
 
 class MonitorRuntimeAndUpdateTest(unittest.TestCase):

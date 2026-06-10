@@ -43,7 +43,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.client.default import DefaultBotProperties
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
@@ -86,6 +86,8 @@ user_session_client: Any = None
 channel_media_clients: dict[str, Any] = {}
 telegram_qr_logins: dict[str, dict[str, Any]] = {}
 GROUP_SUMMARY_MAX_CHARS = 800
+GROUP_DIGEST_MAX_CHARS = 12000
+GROUP_DIGEST_HOUR_OPTIONS = [3, 6, 9, 12, 24, 48]
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -249,6 +251,23 @@ def init_db() -> None:
                 last_seen_at TEXT NOT NULL,
                 active INTEGER DEFAULT 1
             );
+            CREATE TABLE IF NOT EXISTS group_digest_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                chat_title TEXT,
+                chat_username TEXT,
+                sender_id INTEGER,
+                sender_name TEXT,
+                sender_username TEXT,
+                message_id INTEGER,
+                text TEXT NOT NULL,
+                listen_source TEXT DEFAULT 'bot',
+                created_at_ts REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(chat_id, listen_source, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_group_digest_messages_chat_time
+                ON group_digest_messages(chat_id, created_at_ts);
             CREATE TABLE IF NOT EXISTS channel_media_monitors (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 channel_id INTEGER NOT NULL,
@@ -1276,6 +1295,119 @@ def build_group_ai_prompt(message: Message, monitor: dict[str, Any], hits: list[
     return system, user
 
 
+def ai_config_for_group_chat(chat_id: int) -> dict[str, Any] | None:
+    for monitor in group_monitors():
+        if int(monitor.get("chat_id") or 0) == int(chat_id):
+            return monitor
+    return None
+
+
+def build_group_digest_ai_system_prompt(custom_prompt: str) -> str:
+    base = (
+        "你是 Telegram 群消息汇总助手。"
+        "请用简体中文汇总指定时间窗口内的群消息，输出给管理员阅读。"
+        "按主要话题分组，保留重要结论、行动项、数字、价格、链接、联系方式和有价值的原文线索。"
+        "不要编造未出现的信息；如果消息很少或信息不足，请直接说明。"
+    )
+    custom = (custom_prompt or "").strip()
+    if not custom:
+        return base
+    return base + "\n补充要求：\n" + custom
+
+
+def format_group_digest_messages(rows: list[dict[str, Any]], max_chars: int = GROUP_DIGEST_MAX_CHARS) -> tuple[str, bool]:
+    chunks: list[str] = []
+    total = 0
+    truncated = False
+    for row in rows:
+        sender = str(row.get("sender_name") or row.get("sender_id") or "unknown")
+        username = str(row.get("sender_username") or "").strip()
+        if username:
+            sender = f"{sender} (@{username})"
+        link = telegram_message_link(str(row.get("chat_username") or "") or None, int(row["chat_id"]), int(row.get("message_id") or 0))
+        item = (
+            f"时间: {row.get('created_at') or ''}\n"
+            f"发送者: {sender}\n"
+            f"消息ID: {row.get('message_id') or '-'}\n"
+            f"链接: {link}\n"
+            f"正文: {row.get('text') or ''}\n"
+        )
+        if total + len(item) > max_chars:
+            remaining = max_chars - total
+            if remaining > 200:
+                chunks.append(item[:remaining] + "\n...[后续消息因长度限制已截断]")
+            truncated = True
+            break
+        chunks.append(item)
+        total += len(item)
+    return "\n---\n".join(chunks).strip(), truncated
+
+
+async def summarize_group_digest_ai(chat: dict[str, Any], rows: list[dict[str, Any]], hours: int, monitor: dict[str, Any]) -> str | None:
+    ai_base_url = str(monitor.get("ai_base_url") or "").strip()
+    ai_api_key = str(monitor.get("ai_api_key") or "").strip()
+    ai_model = str(monitor.get("ai_model") or "gpt-4o-mini").strip()
+    ai_interface = str(monitor.get("ai_interface") or "responses").strip().lower()
+    ai_timeout = max(1, int(monitor.get("ai_timeout_seconds") or 30))
+    ai_temperature = float(monitor.get("ai_temperature") or 0.2)
+    if not ai_base_url or not ai_api_key or not ai_model:
+        return None
+    messages_text, truncated = format_group_digest_messages(rows)
+    system_prompt = build_group_digest_ai_system_prompt(str(monitor.get("ai_prompt") or ""))
+    user_prompt = (
+        f"群名: {chat.get('title') or chat.get('chat_id')}\n"
+        f"群ID: {chat.get('chat_id')}\n"
+        f"时间窗口: 最近 {hours} 小时\n"
+        f"消息数量: {len(rows)}\n"
+        f"输入是否截断: {'是' if truncated else '否'}\n\n"
+        f"消息列表:\n{messages_text}"
+    )
+    headers = {"Authorization": f"Bearer {ai_api_key}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=ai_timeout, headers=headers) as client:
+        if ai_interface == "chat":
+            payload = {
+                "model": ai_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": ai_temperature,
+            }
+            resp = await client.post(ai_api_url(ai_base_url, "/chat/completions"), json=payload)
+            resp.raise_for_status()
+            return extract_chat_text(resp.json())
+        payload = {
+            "model": ai_model,
+            "instructions": system_prompt,
+            "input": user_prompt,
+            "temperature": ai_temperature,
+            "max_output_tokens": 1200,
+        }
+        resp = await client.post(ai_api_url(ai_base_url, "/responses"), json=payload)
+        resp.raise_for_status()
+        return extract_responses_text(resp.json())
+
+
+async def summarize_group_digest(chat: dict[str, Any], rows: list[dict[str, Any]], hours: int) -> str:
+    monitor = ai_config_for_group_chat(int(chat["chat_id"]))
+    title = str(chat.get("title") or chat.get("chat_id"))
+    if not monitor:
+        return f"[群AI汇总] {html_escape(title)}\n未找到这个群的监听配置。请先在 Web 面板为该群创建监听，并填写 AI 配置。"
+    try:
+        text = await summarize_group_digest_ai(chat, rows, hours, monitor)
+        if text:
+            return f"[群AI汇总] {html_escape(title)} · 最近 {hours} 小时 · {len(rows)} 条消息\n{html_escape(text.strip())}"
+        logger.warning("group digest ai returned empty result chat_id=%s hours=%s", chat.get("chat_id"), hours)
+    except Exception:
+        logger.exception("group digest ai failed chat_id=%s hours=%s", chat.get("chat_id"), hours)
+    formatted, truncated = format_group_digest_messages(rows, max_chars=3000)
+    suffix = "\n（消息较多，以下内容已截断）" if truncated else ""
+    return (
+        f"[群AI汇总失败，已返回原始消息] {html_escape(title)} · 最近 {hours} 小时 · {len(rows)} 条消息{suffix}\n"
+        f"{html_escape(formatted)}"
+    )
+
+
 async def summarize_group_message_ai(message: Message, monitor: dict[str, Any], hits: list[str]) -> str | None:
     ai_base_url = str(monitor.get("ai_base_url") or "").strip()
     ai_api_key = str(monitor.get("ai_api_key") or "").strip()
@@ -1504,26 +1636,6 @@ async def run_user_session_group_listener() -> None:
 
         @client.on(events.NewMessage)  # type: ignore[misc]
         async def on_new_group_message(event: Any) -> None:
-            chat_id = getattr(event, "chat_id", None)
-            if chat_id is None:
-                return
-            cid = int(chat_id)
-            msg = event.message
-            # ---- group monitor (keywords) ----
-            from_cfg = group_monitors()
-            cfg_chat_ids = {int(m["chat_id"]) for m in from_cfg if m.get("enabled")}
-            if cid in cfg_chat_ids:
-                pseudo = build_pseudo_message_from_user_session_event(event)
-                if pseudo is not None:
-                    text_preview = (getattr(pseudo, "text", "") or "")[:80]
-                    logger.info("user_session: msg chat=%s title=%s text=%s", pseudo.chat.id, getattr(pseudo.chat, "title", ""), text_preview)
-                    record_discovered_group_chat_data(
-                        int(pseudo.chat.id),
-                        str(getattr(pseudo.chat, "title", "") or pseudo.chat.id),
-                        str(getattr(pseudo.chat, "username", "") or ""),
-                    )
-                    await handle_group_keyword_message(pseudo, listen_source="user_session")
-
             pseudo = build_pseudo_message_from_user_session_event(event)
             if pseudo is None:
                 logger.debug("user_session: build_pseudo returned None for chat_id=%s", getattr(event, "chat_id", "?"))
@@ -1535,6 +1647,7 @@ async def run_user_session_group_listener() -> None:
                 str(getattr(pseudo.chat, "title", "") or pseudo.chat.id),
                 str(getattr(pseudo.chat, "username", "") or ""),
             )
+            record_group_digest_message(pseudo, listen_source="user_session")
             await handle_group_keyword_message(pseudo, listen_source="user_session")
 
         await client.start()
@@ -1697,6 +1810,93 @@ def list_discovered_group_chats(limit: int = 200) -> list[dict[str, Any]]:
     ]
 
 
+def get_discovered_group_chat(chat_id: int) -> dict[str, Any] | None:
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT chat_id, title, username, last_seen_at, active FROM discovered_group_chats WHERE chat_id=?",
+            (int(chat_id),),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "chat_id": int(row["chat_id"]),
+        "title": str(row["title"] or row["chat_id"]),
+        "username": str(row["username"] or ""),
+        "last_seen_at": str(row["last_seen_at"] or ""),
+        "active": bool(row["active"]),
+    }
+
+
+def record_group_digest_message(message: Message, listen_source: str = "bot") -> bool:
+    text = group_message_text(message)
+    if not text:
+        return False
+    chat_id = int(message.chat.id)
+    chat_title = str(getattr(message.chat, "title", "") or str(chat_id))
+    chat_username = str(getattr(message.chat, "username", "") or "")
+    from_user = getattr(message, "from_user", None)
+    sender_id = getattr(from_user, "id", None)
+    sender_name = " ".join(
+        x for x in [getattr(from_user, "first_name", ""), getattr(from_user, "last_name", "")] if x
+    ).strip()
+    sender_username = str(getattr(from_user, "username", "") or "")
+    ts = time.time()
+    with closing(db()) as conn:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO group_digest_messages(
+                chat_id, chat_title, chat_username, sender_id, sender_name, sender_username,
+                message_id, text, listen_source, created_at_ts, created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                chat_id,
+                chat_title,
+                chat_username,
+                int(sender_id) if sender_id is not None else None,
+                sender_name or (str(sender_id) if sender_id is not None else "unknown"),
+                sender_username,
+                int(getattr(message, "message_id", 0) or 0),
+                text,
+                (listen_source or "bot").strip().lower() or "bot",
+                ts,
+                now_iso(),
+            ),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def list_group_digest_messages(chat_id: int, hours: int) -> list[dict[str, Any]]:
+    cutoff = time.time() - max(1, int(hours)) * 3600
+    with closing(db()) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM group_digest_messages
+            WHERE chat_id=? AND created_at_ts>=?
+            ORDER BY created_at_ts ASC, id ASC
+            """,
+            (int(chat_id), cutoff),
+        ).fetchall()
+    return [
+        {
+            "id": int(row["id"]),
+            "chat_id": int(row["chat_id"]),
+            "chat_title": str(row["chat_title"] or row["chat_id"]),
+            "chat_username": str(row["chat_username"] or ""),
+            "sender_id": int(row["sender_id"]) if row["sender_id"] is not None else None,
+            "sender_name": str(row["sender_name"] or ""),
+            "sender_username": str(row["sender_username"] or ""),
+            "message_id": int(row["message_id"] or 0),
+            "text": str(row["text"] or ""),
+            "listen_source": str(row["listen_source"] or "bot"),
+            "created_at_ts": float(row["created_at_ts"] or 0),
+            "created_at": str(row["created_at"] or ""),
+        }
+        for row in rows
+    ]
+
+
 def lookup_reply_target(admin_chat: int, admin_message_id: int) -> int | None:
     with closing(db()) as conn:
         row = conn.execute(
@@ -1800,6 +2000,23 @@ def is_admin_action_message(message: Message) -> bool:
     return bool(message.reply_to_message and message.text)
 
 
+def group_digest_chat_keyboard(chats: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows = []
+    for chat in chats[:50]:
+        title = str(chat.get("title") or chat.get("chat_id") or "未知群组")
+        label = title if len(title) <= 28 else title[:25] + "..."
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"aidg:g:{int(chat['chat_id'])}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def group_digest_hours_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(text=f"{hours} 小时", callback_data=f"aidg:t:{int(chat_id)}:{hours}")
+        for hours in GROUP_DIGEST_HOUR_OPTIONS
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[buttons[:3], buttons[3:]])
+
+
 @router.message(Command("start"))
 async def start(message: Message) -> None:
     uid, full, username = user_display(message)
@@ -1841,6 +2058,63 @@ async def cmd_reply(message: Message, command: CommandObject) -> None:
 @router.message(Command("send"))
 async def cmd_send(message: Message, command: CommandObject) -> None:
     await send_text_to_user_from_admin(message, command.args, "send")
+
+
+@router.message(Command("ai"))
+async def cmd_ai_digest(message: Message) -> None:
+    if not is_admin_chat(message):
+        return
+    chats = list_discovered_group_chats()
+    if not chats:
+        await message.reply("暂无已发现群组。请先把 Bot 拉进群并收到消息，或启用用户会话监听。")
+        return
+    await message.reply("请选择要汇总的群组：", reply_markup=group_digest_chat_keyboard(chats))
+
+
+@router.callback_query(F.data.startswith("aidg:g:"))
+async def cb_ai_digest_group(callback: CallbackQuery) -> None:
+    message = callback.message
+    if message is None or int(callback.from_user.id) not in all_admin_chat_ids():
+        await callback.answer("无权限", show_alert=True)
+        return
+    try:
+        chat_id = int(str(callback.data or "").split(":", 2)[2])
+    except Exception:
+        await callback.answer("群组参数无效", show_alert=True)
+        return
+    chat = get_discovered_group_chat(chat_id)
+    title = str(chat.get("title") if chat else chat_id)
+    await callback.answer()
+    await message.answer(
+        f"已选择：{html_escape(title)}\n请选择汇总时间范围：",
+        reply_markup=group_digest_hours_keyboard(chat_id),
+    )
+
+
+@router.callback_query(F.data.startswith("aidg:t:"))
+async def cb_ai_digest_hours(callback: CallbackQuery) -> None:
+    message = callback.message
+    if message is None or int(callback.from_user.id) not in all_admin_chat_ids():
+        await callback.answer("无权限", show_alert=True)
+        return
+    try:
+        _, _, chat_id_raw, hours_raw = str(callback.data or "").split(":", 3)
+        chat_id = int(chat_id_raw)
+        hours = int(hours_raw)
+    except Exception:
+        await callback.answer("时间参数无效", show_alert=True)
+        return
+    if hours not in GROUP_DIGEST_HOUR_OPTIONS:
+        await callback.answer("不支持的时间范围", show_alert=True)
+        return
+    chat = get_discovered_group_chat(chat_id) or {"chat_id": chat_id, "title": str(chat_id), "username": ""}
+    rows = list_group_digest_messages(chat_id, hours)
+    await callback.answer("正在汇总，请稍候...")
+    if not rows:
+        await message.answer(f"{html_escape(str(chat.get('title') or chat_id))} 最近 {hours} 小时内没有可汇总的文本消息。")
+        return
+    await message.answer("正在调用 AI 汇总，完成后会推送给管理员。")
+    await admin_send(await summarize_group_digest(chat, rows, hours))
 
 
 @router.message(Command("sendpic"))
@@ -2047,6 +2321,7 @@ async def user_message(message: Message) -> None:
         if message.chat.type in {"group", "supergroup"}:
             try:
                 record_discovered_group_chat(message)
+                record_group_digest_message(message, listen_source="bot")
                 await handle_group_keyword_message(message, listen_source="bot")
             except Exception:
                 logger.exception("group keyword handling failed chat_id=%s message_id=%s", message.chat.id, message.message_id)
