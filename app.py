@@ -4526,6 +4526,7 @@ async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
 
     await admin_send(f"tg-watchbot 已启动\n时间：{now_iso()}")
     logger.info("bot polling start")
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
